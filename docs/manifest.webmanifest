@@ -1,0 +1,17 @@
+{
+  "name": "Futari Days — ふたりのカウントダウン",
+  "short_name": "Futari Days",
+  "description": "婚約・顔合わせ・結婚式まであと何日？ふたりでタスクも管理。",
+  "lang": "ja",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#FFF6F3",
+  "theme_color": "#FFF6F3",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
