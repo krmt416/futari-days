@@ -29,6 +29,7 @@
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({ a: action, s: withSession ? store.get() : '', p: payload || {} }),
         redirect: 'follow',
+        keepalive: true,   // 画面を閉じる直前の書き込みも最後まで送る
         credentials: 'omit',
         referrerPolicy: 'no-referrer',
         signal: ctrl.signal
@@ -48,7 +49,7 @@
     }
   }
 
-  const WRITES = new Set(['saveProfile', 'saveEvent', 'deleteEvent', 'saveTask', 'toggleTask', 'deleteTask']);
+  const WRITES = new Set(['saveProfile', 'saveEvent', 'deleteEvent', 'saveTask', 'toggleTask', 'togglePaid', 'deleteTask']);
 
   const real = {
     async call(action, payload) {
@@ -85,21 +86,21 @@
     const e3 = ev('入籍', '📝', 'nyuseki', 121, 'sage', '');
     const e4 = ev('結婚式', '💒', 'wedding', 301, 'rose', 'ホテル グランベル', '11:30');
     const events = [e1, e2, e3, e4];
-    const tk = (eventId, title, due, assignee, done) => ({
+    const tk = (eventId, title, due, assignee, done, who) => ({
       id: uuid(), eventId, title, note: '', due, assignee, done: !!done,
-      doneBy: done ? (assignee === pt ? pt : me) : '', doneAt: done ? new Date(Date.now() - 3600e3 * 5).toISOString() : '',
-      createdBy: me, createdAt: now, updatedAt: now
+      doneBy: done ? (who === 'pt' || assignee === pt ? pt : me) : '', doneAt: done ? new Date(Date.now() - 3600e3 * (who === 'pt' ? 2 : 5)).toISOString() : '',
+      createdBy: who === 'pt' ? pt : me, createdAt: who === 'pt' ? new Date(Date.now() - 3600e3 * 3).toISOString() : now, updatedAt: now
     });
     const tasks = [
       tk(e2.id, '双方の親に顔合わせを打診', dstr(-26), 'both', true),
-      tk(e2.id, '候補日を3つ出して日程調整', dstr(-16), 'both', true),
-      tk(e2.id, 'お店を予約（個室・アレルギー確認）', dstr(-6), pt, false),
+      tk(e2.id, '候補日を3つ出して日程調整', dstr(-16), 'both', true, 'pt'),
+      Object.assign(tk(e2.id, 'お店を予約（個室・アレルギー確認）', dstr(-6), pt, false), { cost: 30000, paid: true }),
       tk(e2.id, '席順と当日の進行を決める', dstr(13), me, false),
-      tk(e2.id, '手土産・記念品を用意', dstr(20), pt, false),
+      Object.assign(tk(e2.id, '手土産・記念品を用意', dstr(20), pt, false, 'pt'), { cost: 8000, paid: false }),
       tk(e2.id, '服装・集合時間を両家に共有', dstr(24), 'both', false),
       tk(e3.id, '戸籍謄本など必要書類を取得', dstr(100), me, false),
       tk(e3.id, '婚姻届を記入・証人に署名をお願い', dstr(107), 'both', false),
-      tk(e4.id, '式場を見学して仮予約', dstr(61), 'both', false),
+      Object.assign(tk(e4.id, '式場を見学して仮予約', dstr(61), 'both', false), { cost: 50000, paid: false }),
       tk(e4.id, '招待客リストを作る', dstr(151), 'both', false),
       tk('', '新居の家具をリストアップ', '', pt, false)
     ];
@@ -182,6 +183,8 @@
           let rec = s.id && d.tasks.find((t) => t.id === s.id);
           if (!rec) { rec = { id: uuid(), done: false, doneBy: '', doneAt: '', createdBy: d.me, createdAt: now }; d.tasks.push(rec); }
           Object.assign(rec, { eventId: s.eventId || '', title: clip(s.title, 80), note: clip(s.note, 300), due: s.due || '', assignee: s.assignee || 'both', updatedAt: now });
+          if ('cost' in s) { const n = s.cost === null || s.cost === '' ? null : Number(s.cost); if (n !== null && (!Number.isInteger(n) || n < 0 || n > 99999999)) throw new ApiError('INVALID', '費用は 0〜99,999,999 の整数（円）で入力してください'); rec.cost = n; }
+          if ('paid' in s) rec.paid = s.paid === true;
           return { task: rec, version: bump() };
         }
         case 'toggleTask': {
@@ -189,6 +192,11 @@
           if (!t) throw new ApiError('NOT_FOUND', 'タスクが見つかりません');
           t.done = p.done === true; t.doneBy = t.done ? d.me : ''; t.doneAt = t.done ? new Date().toISOString() : '';
           return { task: t, version: bump() };
+        }
+        case 'togglePaid': {
+          const t = d.tasks.find((x) => x.id === p.id);
+          if (!t) throw new ApiError('NOT_FOUND', 'タスクが見つかりません');
+          t.paid = p.paid === true; return { task: t, version: bump() };
         }
         case 'deleteTask': {
           d.tasks = d.tasks.filter((t) => t.id !== p.id);

@@ -60,11 +60,16 @@
   const S = {
     status: 'boot', // boot | login | app
     me: '', members: [], events: [], tasks: [], version: '',
-    tab: 'home', scope: 'all', evFilter: '', showDone: false,
+    tab: 'home', scope: lsGet('fd.scope') || 'all', evFilter: lsGet('fd.evf') || '', showDone: false,
     heroIdx: 0, enter: true, syncing: false, offline: !navigator.onLine,
     loginError: '', loginBusy: false, theme: lsGet('fd.theme') || 'auto'
   };
+  S.seenAt = (() => { const v = Number(lsGet('fd.seen')); if (v) return v; lsSet('fd.seen', String(Date.now())); return Date.now(); })();
+  S.collapsed = (() => { try { return new Set(JSON.parse(lsGet('fd.col') || '[]')); } catch (e) { return new Set(); } })();
   const counted = new Set();
+  const hidden = new Set();          // 「元に戻す」待ちで一時的に隠している id
+  const pendingDel = new Map();      // 削除の確定待ち
+  const MS_DAYS = [100, 50, 30, 14, 7, 3, 1];   // カウントダウンの節目
   let sheetRender = null;
   let sheetOpen = false;
   let lastFocus = null;
@@ -82,7 +87,7 @@
     return false;
   };
   const applySnapshot = (snap) => {
-    S.me = snap.me; S.members = snap.members || []; S.events = snap.events || []; S.tasks = snap.tasks || []; S.version = snap.version || '';
+    S.me = snap.me; S.members = snap.members || []; S.events = (snap.events || []).filter((e) => !hidden.has(e.id)); S.tasks = (snap.tasks || []).filter((t) => !hidden.has(t.id)); S.version = snap.version || '';
     saveCache();
   };
 
@@ -112,16 +117,45 @@
     const done = ts.filter((t) => t.done).length;
     return { total: ts.length, done, pct: ts.length ? done / ts.length : 0 };
   };
+  const isNewTask = (t) => {
+    const p = ptM(); if (!p || String(t.id).startsWith('tmp_')) return false;
+    return (t.createdBy === p.uid && Date.parse(t.createdAt) > S.seenAt) || (t.done && t.doneBy === p.uid && Date.parse(t.doneAt) > S.seenAt);
+  };
+  const activityItems = () => {
+    const p = ptM(); if (!p) return [];
+    const lim = Date.now() - 14 * 86400000; const out = [];
+    S.tasks.forEach((t) => {   // 1つのタスクにつき、いちばん新しい動きだけ
+      const c = t.createdBy === p.uid && Date.parse(t.createdAt) > lim ? { at: t.createdAt, type: 'add', id: t.id, title: t.title } : null;
+      const d = t.done && t.doneBy === p.uid && Date.parse(t.doneAt) > lim ? { at: t.doneAt, type: 'done', id: t.id, title: t.title } : null;
+      const pick = d && (!c || d.at >= c.at) ? d : c; if (pick) out.push(pick);
+    });
+    S.events.forEach((e) => { if (e.createdBy === p.uid && Date.parse(e.createdAt) > lim) out.push({ at: e.createdAt, type: 'ev', id: e.id, title: e.title }); });
+    return out.sort((a, b) => b.at.localeCompare(a.at)).slice(0, 4);
+  };
+  const clipTxt = (x, n = 14) => (x.length > n ? `${x.slice(0, n)}…` : x);
+  const yen = (n) => `¥${Number(n).toLocaleString('ja-JP')}`;
+  const costStats = (ts) => {
+    let total = 0; let paid = 0; let n = 0;
+    ts.forEach((t) => { if (t.cost != null) { n++; total += t.cost; if (t.paid) paid += t.cost; } });
+    return { n, total, paid, unpaid: total - paid, pct: total ? paid / total : 0 };
+  };
   const byDue = (a, b) => (a.due || '9999').localeCompare(b.due || '9999') || (a.createdAt || '').localeCompare(b.createdAt || '');
 
   /* ============================== トースト / 紙吹雪 ============================== */
-  const toast = (msg, kind = '') => {
+  const toast = (msg, kind = '', opts = {}) => {
     const el = document.createElement('div');
-    el.className = `toast ${kind}`;
-    el.textContent = msg;
+    el.className = `toast ${kind}${opts.action ? ' act' : ''}`;
+    const sp = document.createElement('span'); sp.textContent = msg; el.appendChild(sp);
+    let timer = 0;
+    const close = () => { clearTimeout(timer); el.classList.remove('in'); setTimeout(() => el.remove(), 300); };
+    if (opts.action) {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = opts.action.label;
+      b.addEventListener('click', () => { close(); opts.action.fn(); }); el.appendChild(b);
+    }
     $('#toasts').appendChild(el);
     requestAnimationFrame(() => el.classList.add('in'));
-    setTimeout(() => { el.classList.remove('in'); setTimeout(() => el.remove(), 300); }, kind === 'err' ? 4200 : 2200);
+    timer = setTimeout(close, opts.ttl || (kind === 'err' ? 4200 : 2200));
+    return close;
   };
   const toastErr = (e) => toast((e && e.message) || 'うまくいきませんでした', 'err');
 
@@ -239,6 +273,9 @@
       const span = Math.max(1, daysFrom(ev.date, start)); pct = Math.min(1, Math.max(0, 1 - days / span)); label = '経過';
     }
     const wk = weeksText(days);
+    const pills = [];
+    if (MS_DAYS.includes(days)) pills.push(`🎯 あと${days}日の節目`);
+    if (st.total > 0 && st.done === st.total) pills.push('✨ 準備ばっちり');
     return `<article class="hero c-${colorOf(ev.color)}" data-action="open-event" data-id="${esc(ev.id)}" role="button" tabindex="0" aria-label="${esc(ev.title)} まであと${days}日">
       <i class="orb o1"></i><i class="orb o2"></i><i class="orb o3"></i>
       <div class="hero-top"><span class="hero-kind"><span class="hero-emoji">${esc(ev.emoji)}</span>${esc(kindOf(ev).label)}</span>${ringSvg(pct, label)}</div>
@@ -247,6 +284,7 @@
       </div>
       <h2 class="hero-title">${esc(ev.title)}</h2>
       <p class="hero-date">${fmtDate(ev.date)}${ev.time ? `　${esc(ev.time)}〜` : ''}</p>
+      ${pills.length ? `<div class="hero-pills">${pills.map((x) => `<span>${esc(x)}</span>`).join('')}</div>` : ''}
       <p class="hero-sub">${wk ? `<b>${wk}</b>　` : ''}${esc(heroMsg(days))}</p>
       <span class="hero-label">${esc(label)}</span>
     </article>`;
@@ -277,6 +315,33 @@
       <span class="edays">${when}</span></button>`;
   };
 
+  const todayHtml = () => {
+    if (!S.tasks.length) return '';
+    const p = ptM(); const open = S.tasks.filter((t) => !t.done);
+    const mineOk = (t) => t.assignee === 'both' || t.assignee === S.me || !mem(t.assignee);
+    const mine = open.filter((t) => t.due && daysFrom(t.due) <= 0 && mineOk(t)).sort(byDue);
+    const theirs = p ? open.filter((t) => t.due && daysFrom(t.due) <= 0 && t.assignee === p.uid).length : 0;
+    if (!mine.length) {
+      const next = open.filter((t) => t.due && daysFrom(t.due) > 0 && mineOk(t)).sort(byDue)[0];
+      const sub = next ? `次は「${esc(clipTxt(next.title, 18))}」（${fmtMDW(next.due)}）` : theirs ? `${esc(nameOf(p.uid))}の今日ぶんが${theirs}件あります` : 'ゆっくり休んでね';
+      return `<section class="card todaydone"><span class="td-emoji">🎉</span><div><b>今日やることは完了！</b><small>${sub}</small></div></section>`;
+    }
+    return `<section class="today"><h3 class="sec">今日やること<small>${mine.length}</small></h3>
+      <ul class="tlist">${mine.slice(0, 5).map((t) => taskRow(t)).join('')}</ul>
+      ${mine.length > 5 ? `<button class="more" data-action="goto-tasks">ほか${mine.length - 5}件をタスクで見る ›</button>` : ''}
+      ${theirs ? `<p class="fine-note">${esc(nameOf(p.uid))}の今日ぶん：${theirs}件</p>` : ''}</section>`;
+  };
+
+  const activityHtml = () => {
+    const p = ptM(); const items = activityItems(); if (!p || !items.length) return '';
+    const row = (it) => {
+      const verb = it.type === 'done' ? 'を完了' : it.type === 'add' ? 'を追加' : 'を予定に追加';
+      const nw = Date.parse(it.at) > S.seenAt ? '<i class="newdot">NEW</i>' : '';
+      return `<button class="act-row" data-action="${it.type === 'ev' ? 'open-event' : 'edit-task'}" data-id="${esc(it.id)}">${av(p, 'sm')}<span class="act-text"><b>${esc(nameOf(p.uid))}</b>が<em>「${esc(clipTxt(it.title))}」</em>${verb}</span>${nw}<small>${ago(it.at)}</small></button>`;
+    };
+    return `<section><h3 class="sec">${esc(nameOf(p.uid))}の動き</h3><div class="card actcard">${items.map(row).join('')}</div></section>`;
+  };
+
   const viewHome = () => {
     const m = meM(); const p = ptM();
     const up = S.events.filter((e) => daysFrom(e.date) >= 0).sort((a, b) => a.date.localeCompare(b.date) || (a.time || '').localeCompare(b.time || ''));
@@ -299,11 +364,18 @@
         <section class="heroes ${up.length > 1 ? 'multi' : ''}" id="heroes" aria-label="これからの予定">${up.map(heroHtml).join('')}</section>
         ${up.length > 1 ? `<div class="dots" aria-hidden="true">${up.map((_, i) => `<i class="${i === S.heroIdx ? 'on' : ''}"></i>`).join('')}</div>` : ''}`
         : `<section class="empty hero-empty card"><div class="big-emoji">💍</div><h2>最初の「その日」を決めよう</h2><p>婚約・顔合わせ・結婚式…<br>日付を入れると、あと何日かがここに大きく表示されます。</p><button class="btn primary" data-action="new-event">${ICON.plus}予定を追加する</button></section>`}
+      ${todayHtml()}
+      ${activityHtml()}
       ${sinceCardHtml()}
       <section class="stats">
         <button class="stat" data-action="goto-tasks"><small>今週のやること</small><b>${soon}<span>件</span></b>${late ? `<em class="warn">期限切れ ${late}件</em>` : '<em>順調です</em>'}</button>
         <button class="stat" data-action="goto-tasks"><small>完了したタスク</small><b>${doneN}<span>/ ${S.tasks.length}</span></b><div class="bar"><i style="width:${S.tasks.length ? Math.round(doneN / S.tasks.length * 100) : 0}%"></i></div></button>
       </section>
+      ${(() => {
+        const cs = costStats(S.tasks); if (!cs.n) return '';
+        return `<section class="card costhome"><div class="cc-head"><small>費用の合計（${cs.n}件）</small><strong>${yen(cs.total)}</strong></div><div class="bar"><i style="width:${Math.round(cs.pct * 100)}%"></i></div>
+          <div class="cc-sub"><span>支払い済み <b>${yen(cs.paid)}</b></span><span>未払い <b>${yen(cs.unpaid)}</b></span></div></section>`;
+      })()}
       ${up.length ? `<section><h3 class="sec">これからの予定<small>${up.length}</small></h3><div class="list">${up.map((e) => ecardHtml(e, false)).join('')}</div></section>` : ''}
       ${past.length ? `<section><h3 class="sec">ふたりのあゆみ<small>${past.length}</small></h3><div class="list">${past.map((e) => ecardHtml(e, true)).join('')}</div></section>` : ''}`;
   };
@@ -324,13 +396,14 @@
   const taskRow = (t, showEvent = true) => {
     const ev = t.eventId ? evById(t.eventId) : null;
     const tmp = String(t.id).startsWith('tmp_');
-    return `<li class="task ${t.done ? 'done' : ''} ${tmp ? 'tmp' : ''}" data-id="${esc(t.id)}">
+    return `<li class="tw"><div class="swbg" aria-hidden="true"><span class="swl">${ICON.check}${t.done ? '未完了に戻す' : '完了'}</span><span class="swr">削除${ICON.trash}</span></div>
+      <div class="task ${t.done ? 'done' : ''} ${tmp ? 'tmp' : ''}" data-id="${esc(t.id)}">
       <button class="check" data-action="toggle-task" data-id="${esc(t.id)}" role="checkbox" aria-checked="${t.done}" aria-label="${esc(t.title)} を${t.done ? '未完了に戻す' : '完了にする'}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5.5 12.5 4.2 4.2L18.5 8"/></svg></button>
       <div class="tmain" data-action="edit-task" data-id="${esc(t.id)}" role="button" tabindex="0">
         <div class="ttitle">${esc(t.title)}</div>
-        <div class="tmeta">${showEvent && ev ? `<span class="chip c-${colorOf(ev.color)}">${esc(ev.emoji)} ${esc(ev.title)}</span>` : ''}${dueChip(t)}${t.note ? `<span class="chip">${ICON.note}</span>` : ''}${t.done && t.doneBy ? `<span class="chip ok">${esc(nameOf(t.doneBy))}が完了</span>` : ''}</div>
+        <div class="tmeta">${isNewTask(t) ? '<span class="chip new">NEW</span>' : ''}${showEvent && ev ? `<span class="chip c-${colorOf(ev.color)}">${esc(ev.emoji)} ${esc(ev.title)}</span>` : ''}${dueChip(t)}${t.cost != null ? `<span class="chip cost ${t.paid ? 'paid' : ''}">${t.paid ? '✓ ' : ''}${yen(t.cost)}</span>` : ''}${t.note ? `<span class="chip">${ICON.note}</span>` : ''}${t.done && t.doneBy ? `<span class="chip ok">${esc(nameOf(t.doneBy))}が完了</span>` : ''}</div>
       </div>
-      <div class="tav">${assigneeHtml(t)}</div></li>`;
+      <div class="tav">${assigneeHtml(t)}</div></div></li>`;
   };
 
   const scopeFilter = (t) => {
@@ -348,16 +421,22 @@
 
   const viewTasks = () => {
     const m = meM(); const p = ptM();
+    if (S.evFilter && S.evFilter !== 'none' && !evById(S.evFilter)) S.evFilter = '';
     const list = S.tasks.filter((t) => scopeFilter(t) && (S.evFilter === '' ? true : S.evFilter === 'none' ? !t.eventId : t.eventId === S.evFilter));
     const open = list.filter((t) => !t.done).sort(byDue); const done = list.filter((t) => t.done).sort((a, b) => (b.doneAt || '').localeCompare(a.doneAt || ''));
     const g = { overdue: [], today: [], week: [], later: [], nodue: [] };
     open.forEach((t) => {
       if (!t.due) g.nodue.push(t); else { const d = daysFrom(t.due); (d < 0 ? g.overdue : d === 0 ? g.today : d <= 7 ? g.week : g.later).push(t); }
     });
-    const sec = (title, items, cls = '') => items.length ? `<section class="tgroup ${cls}"><h3 class="sec">${title}<small>${items.length}</small></h3><ul class="tlist">${items.map((t) => taskRow(t)).join('')}</ul></section>` : '';
+    const sec = (key, title, items, cls = '') => {
+      if (!items.length) return '';
+      const col = S.collapsed.has(key);
+      return `<section class="tgroup ${cls}"><button class="sec fold" data-action="toggle-group" data-key="${key}" aria-expanded="${!col}"><span>${title}<small>${items.length}</small></span><span class="chev ${col ? '' : 'up'}">⌄</span></button>${col ? '' : `<ul class="tlist">${items.map((t) => taskRow(t)).join('')}</ul>`}</section>`;
+    };
+    const openAll = S.tasks.filter((t) => !t.done);
+    const cnt = { all: openAll.length, mine: openAll.filter((t) => t.assignee === 'both' || t.assignee === S.me).length, partner: p ? openAll.filter((t) => t.assignee === 'both' || t.assignee === p.uid).length : 0 };
     const mp = memberProgress(m); const pp = p ? memberProgress(p) : null;
     const total = S.tasks.length; const dn = S.tasks.filter((t) => t.done).length;
-    const recent = S.tasks.filter((t) => t.done && t.doneAt && Date.now() - new Date(t.doneAt).getTime() < 7 * 86400000 && t.doneBy && t.doneBy !== S.me).sort((a, b) => b.doneAt.localeCompare(a.doneAt))[0];
     const evChips = S.events.slice().sort((a, b) => a.date.localeCompare(b.date)).map((e) => `<button class="fchip c-${colorOf(e.color)} ${S.evFilter === e.id ? 'on' : ''}" data-action="ev-filter" data-id="${esc(e.id)}">${esc(e.emoji)} ${esc(e.title)}</button>`).join('');
     return `
       <header class="topbar"><div><p class="hello">ふたりでやること</p><h1 class="big">タスク</h1></div>
@@ -369,22 +448,21 @@
           ${p ? `<div class="prow">${av(p, 'sm')}<span>${esc(p.name || 'パートナー')}</span><div class="bar c-${colorOf(p.color)}"><i style="width:${Math.round(pp.pct * 100)}%"></i></div><small>${pp.done}/${pp.total}</small></div>` : ''}
         </div>
       </section>
-      ${recent ? `<p class="activity">${av(mem(recent.doneBy), 'sm')}<span><b>${esc(nameOf(recent.doneBy))}</b>が「${esc(recent.title)}」を完了 ・ ${ago(recent.doneAt)}</span></p>` : ''}
       <form class="quick" data-form="quick-task" autocomplete="off">
         <input id="quick-title" name="title" maxlength="80" placeholder="やることをすばやく追加…" enterkeyhint="done" aria-label="タスク名">
         <button class="btn primary sq" aria-label="追加">${ICON.plus}</button>
       </form>
       <div class="seg" role="tablist" aria-label="担当で絞り込み">
-        <button role="tab" aria-selected="${S.scope === 'all'}" class="${S.scope === 'all' ? 'on' : ''}" data-action="scope" data-scope="all">ふたり</button>
-        <button role="tab" aria-selected="${S.scope === 'mine'}" class="${S.scope === 'mine' ? 'on' : ''}" data-action="scope" data-scope="mine">${esc(m.name || '自分')}</button>
-        ${p ? `<button role="tab" aria-selected="${S.scope === 'partner'}" class="${S.scope === 'partner' ? 'on' : ''}" data-action="scope" data-scope="partner">${esc(p.name || 'パートナー')}</button>` : ''}
+        <button role="tab" aria-selected="${S.scope === 'all'}" class="${S.scope === 'all' ? 'on' : ''}" data-action="scope" data-scope="all">ふたり<small class="cnt">${cnt.all}</small></button>
+        <button role="tab" aria-selected="${S.scope === 'mine'}" class="${S.scope === 'mine' ? 'on' : ''}" data-action="scope" data-scope="mine">${esc(m.name || '自分')}<small class="cnt">${cnt.mine}</small></button>
+        ${p ? `<button role="tab" aria-selected="${S.scope === 'partner'}" class="${S.scope === 'partner' ? 'on' : ''}" data-action="scope" data-scope="partner">${esc(p.name || 'パートナー')}<small class="cnt">${cnt.partner}</small></button>` : ''}
       </div>
       <div class="fchips" role="group" aria-label="予定で絞り込み">
         <button class="fchip ${S.evFilter === '' ? 'on' : ''}" data-action="ev-filter" data-id="">すべて</button>${evChips}<button class="fchip ${S.evFilter === 'none' ? 'on' : ''}" data-action="ev-filter" data-id="none">予定なし</button>
       </div>
-      ${sec('期限切れ', g.overdue, 'late')}${sec('今日', g.today)}${sec('今週', g.week)}${sec('これから', g.later)}${sec('期限なし', g.nodue)}
+      ${sec('overdue', '期限切れ', g.overdue, 'late')}${sec('today', '今日', g.today)}${sec('week', '今週', g.week)}${sec('later', 'これから', g.later)}${sec('nodue', '期限なし', g.nodue)}
       ${!open.length ? `<section class="empty card"><div class="big-emoji">${list.length ? '🎉' : '📝'}</div><h2>${list.length ? 'ぜんぶ完了！' : 'タスクはまだありません'}</h2><p>${list.length ? 'ふたりともおつかれさま。' : '上の入力欄から、思いついたことをどんどん追加しよう。'}</p></section>` : ''}
-      ${done.length ? `<section class="tgroup donegrp"><button class="sec toggle" data-action="toggle-done" aria-expanded="${S.showDone}"><span>完了したタスク<small>${done.length}</small></span><span class="chev ${S.showDone ? 'up' : ''}">⌄</span></button>${S.showDone ? `<ul class="tlist">${done.map((t) => taskRow(t)).join('')}</ul>` : ''}</section>` : ''}`;
+      ${done.length ? `<section class="tgroup donegrp"><button class="sec fold" data-action="toggle-done" aria-expanded="${S.showDone}"><span>完了したタスク<small>${done.length}</small></span><span class="chev ${S.showDone ? 'up' : ''}">⌄</span></button>${S.showDone ? `<ul class="tlist">${done.map((t) => taskRow(t)).join('')}</ul>` : ''}</section>` : ''}`;
   };
 
   /* ============================== 描画: 設定 ============================== */
@@ -416,7 +494,7 @@
         <button class="setrow btn-row danger" data-action="logout-all"><span>すべての端末からログアウト</span><span class="chev r">›</span></button>
         ${Api.DEMO ? '<button class="setrow btn-row" data-action="reset-demo"><span>デモデータをリセット</span><span class="chev r">›</span></button>' : ''}
       </section>
-      <p class="ver">Futari Days v1.0.0${Api.DEMO ? ' ・ デモモード（この端末のみに保存）' : ''}</p>`;
+      <p class="ver">Futari Days v1.4.0${Api.DEMO ? ' ・ デモモード（この端末のみに保存）' : ''}</p>`;
   };
 
   /* ============================== 描画: 全体 ============================== */
@@ -436,7 +514,7 @@
       ${S.offline ? '<div class="offline">オフラインです。保存済みの内容を表示しています</div>' : ''}
       <main class="view ${S.enter ? 'enter' : ''}" id="view">${view}</main>
       <nav class="tabbar" aria-label="メインメニュー">${tab('home', ICON.home, 'ホーム')}${tab('tasks', ICON.tasks, 'タスク', overdue || '')}${tab('settings', ICON.gear, '設定')}</nav>
-      ${S.tab !== 'settings' ? `<button class="fab" data-action="fab">${ICON.plus}<span>${S.tab === 'home' ? '予定を追加' : 'タスクを追加'}</span></button>` : ''}`;
+      ${S.tab !== 'settings' ? `<button class="fab" data-action="fab" aria-label="${S.tab === 'home' ? '予定を追加' : 'タスクを追加'}">${ICON.plus}</button>` : ''}`;
     S.enter = false;
     if (!S.enter) window.scrollTo(0, y);
     const h2 = $('#heroes'); if (h2) h2.scrollLeft = hx;
@@ -537,6 +615,12 @@
           ${ev.place ? `<p class="info">${ICON.pin}<span>${esc(ev.place)}</span></p>` : ''}
           ${ev.note ? `<p class="info">${ICON.note}<span>${esc(ev.note).replace(/\n/g, '<br>')}</span></p>` : ''}
           <div class="es-prog"><div class="es-prog-h"><b>この日までの準備</b><small>${st.total ? `${st.done}/${st.total} 完了` : 'タスクなし'}</small></div><div class="bar big"><i style="width:${Math.round(st.pct * 100)}%"></i></div></div>
+          ${(() => {
+            const cs = costStats(ts); if (!cs.n) return '';
+            const rows = ts.filter((t) => t.cost != null).sort(byDue).map((t) => `<div class="cost-row"><span class="ct">${esc(t.title)}</span><b>${yen(t.cost)}</b><button class="paypill ${t.paid ? 'on' : ''}" data-action="toggle-paid" data-id="${esc(t.id)}" aria-pressed="${t.paid}">${t.paid ? '支払い済み' : '未払い'}</button></div>`).join('');
+            return `<div class="card costcard"><div class="cc-head"><b>費用</b><strong>${yen(cs.total)}</strong></div><div class="bar"><i style="width:${Math.round(cs.pct * 100)}%"></i></div>
+              <div class="cc-sub"><span>支払い済み <b>${yen(cs.paid)}</b></span><span>未払い <b>${yen(cs.unpaid)}</b></span></div>${rows}</div>`;
+          })()}
           <form class="quick" data-form="event-task" data-event="${esc(id)}" autocomplete="off">
             <input id="sheet-quick" name="title" maxlength="80" placeholder="この日に必要なことを追加…" enterkeyhint="done" aria-label="タスク名">
             <button class="btn primary sq" aria-label="追加">${ICON.plus}</button></form>
@@ -581,7 +665,7 @@
   const taskForm = (t, defaults = {}) => {
     sheetRender = null;
     const editing = !!t; const p = ptM(); const m = meM();
-    const cur = t || { title: '', note: '', due: '', eventId: defaults.eventId || '', assignee: 'both' };
+    const cur = t || { title: '', note: '', due: '', eventId: defaults.eventId || '', assignee: 'both', cost: null, paid: false };
     const ev = S.events.slice().sort((a, b) => a.date.localeCompare(b.date));
     const quick = [['今日', 0], ['明日', 1], ['1週間後', 7], ['2週間後', 14]];
     openSheet(`
@@ -595,6 +679,9 @@
           <input type="hidden" name="assignee" value="${esc(mem(cur.assignee) ? cur.assignee : 'both')}"></div>
         <div class="field"><label for="t-due">期限（任意）</label><input id="t-due" type="date" name="due" value="${esc(cur.due)}">
           <div class="qchips">${quick.map(([l, n]) => `<button type="button" class="fchip" data-action="quick-due" data-n="${n}">${l}</button>`).join('')}<button type="button" class="fchip" data-action="quick-due" data-n="clear">なし</button></div></div>
+        <div class="field"><label for="t-cost">費用（任意）</label>
+          <div class="yen"><span aria-hidden="true">¥</span><input id="t-cost" name="cost" type="text" inputmode="numeric" maxlength="12" autocomplete="off" value="${cur.cost != null ? esc(cur.cost) : ''}" placeholder="例：50000"></div>
+          <label class="toggle paidtg"><input type="checkbox" name="paid" ${cur.paid ? 'checked' : ''}><span><b>支払い済み</b><small>支払いが終わったらチェック</small></span></label></div>
         <div class="field"><label for="t-ev">どの予定のため？</label><select id="t-ev" name="eventId"><option value="">（予定なし）</option>${ev.map((e) => `<option value="${esc(e.id)}" ${cur.eventId === e.id ? 'selected' : ''}>${esc(e.emoji)} ${esc(e.title)}（${fmtMD(e.date)}）</option>`).join('')}</select></div>
         <div class="field"><label for="t-note">メモ（任意）</label><textarea id="t-note" name="note" maxlength="300" rows="2" placeholder="URL・電話番号・補足など">${esc(cur.note)}</textarea></div>
         <p class="form-err" role="alert"></p>
@@ -621,17 +708,53 @@
   const mergeById = (arr, item) => { const i = arr.findIndex((x) => x.id === item.id); if (i >= 0) arr[i] = item; else arr.push(item); };
   const afterWrite = (r) => { if (r && r.version) { if (r.prevVersion === S.version || !S.version) S.version = r.version; } saveCache(); };
 
+  /* ---- 元に戻せる削除（5秒以内なら取り消せる。確定はその後） ---- */
+  const queueDelete = ({ key, ids, label, removed, call }) => {
+    ids.forEach((i) => hidden.add(i));
+    const restore = () => { removed.events.forEach((e) => mergeById(S.events, e)); removed.tasks.forEach((t) => mergeById(S.tasks, t)); render(); };
+    const commit = async () => {
+      const p = pendingDel.get(key); if (!p) return; pendingDel.delete(key); clearTimeout(p.timer);
+      try { const r = await Api.call(call.action, call.payload); afterWrite(r); }
+      catch (e) { ids.forEach((i) => hidden.delete(i)); restore(); toastErr(e); handleAuth(e); return; }
+      ids.forEach((i) => hidden.delete(i));
+    };
+    const undo = () => { const p = pendingDel.get(key); if (!p) return; clearTimeout(p.timer); pendingDel.delete(key); ids.forEach((i) => hidden.delete(i)); restore(); haptic(8); };
+    pendingDel.set(key, { timer: setTimeout(commit, 5500), commit });
+    toast(label, '', { ttl: 5500, action: { label: '元に戻す', fn: undo } });
+  };
+  const flushPending = () => { Array.from(pendingDel.values()).forEach((p) => p.commit()); };
+  const removeTask = (id) => {
+    const t = S.tasks.find((x) => x.id === id); if (!t) return;
+    S.tasks = S.tasks.filter((x) => x.id !== id); render();
+    queueDelete({ key: `t${id}`, ids: [id], label: `「${clipTxt(t.title)}」を削除しました`, removed: { events: [], tasks: [t] }, call: { action: 'deleteTask', payload: { id } } });
+  };
+  const removeEvent = (id) => {
+    const ev = evById(id); if (!ev) return;
+    const ts = S.tasks.filter((t) => t.eventId === id);
+    S.events = S.events.filter((x) => x.id !== id); S.tasks = S.tasks.filter((t) => t.eventId !== id); render();
+    queueDelete({ key: `e${id}`, ids: [id, ...ts.map((t) => t.id)], label: `「${clipTxt(ev.title)}」を削除しました`, removed: { events: [ev], tasks: ts }, call: { action: 'deleteEvent', payload: { id } } });
+  };
+
   const toggleTask = async (id) => {
     const t = S.tasks.find((x) => x.id === id); if (!t || String(id).startsWith('tmp_')) return;
     const prev = { done: t.done, doneBy: t.doneBy, doneAt: t.doneAt };
     const done = !t.done;
     Object.assign(t, { done, doneBy: done ? S.me : '', doneAt: done ? new Date().toISOString() : '' });
+    let pos = null;
+    if (done) { const el = $(`.task[data-id="${CSS.escape(id)}"] .check`); if (el) { const r = el.getBoundingClientRect(); pos = { x: r.left + r.width / 2, y: r.top + r.height / 2 }; } }
     haptic(done ? 18 : 8); render();
     if (done) {
-      const el = $(`.task[data-id="${CSS.escape(id)}"] .check`); if (el) { const r = el.getBoundingClientRect(); burst({ x: r.left + r.width / 2, y: r.top + r.height / 2, n: 18, power: 4 }); }
+      if (pos) burst({ x: pos.x, y: pos.y, n: 18, power: 4 });
       if (t.eventId) { const st = evStats(t.eventId); if (st.total > 1 && st.done === st.total) { const ev = evById(t.eventId); setTimeout(() => { burst({ n: 120 }); toast(`🎉 「${ev ? ev.title : ''}」の準備、ぜんぶ完了！`); }, 350); } }
     }
     try { const r = await Api.call('toggleTask', { id, done }); mergeById(S.tasks, r.task); afterWrite(r); render(); } catch (e) { Object.assign(t, prev); render(); toastErr(e); handleAuth(e); }
+  };
+
+  const togglePaid = async (id) => {
+    const t = S.tasks.find((x) => x.id === id); if (!t || t.cost == null || String(id).startsWith('tmp_')) return;
+    const prev = t.paid; t.paid = !prev; haptic(10); render();
+    try { const r = await Api.call('togglePaid', { id, paid: t.paid }); mergeById(S.tasks, r.task); afterWrite(r); render(); }
+    catch (e) { t.paid = prev; render(); toastErr(e); handleAuth(e); }
   };
 
   const quickAdd = async (title, eventId) => {
@@ -671,7 +794,7 @@
 
   const pollTick = async () => {
     if (document.hidden || S.status !== 'app' || S.syncing) return;
-    if (S.tasks.some((t) => String(t.id).startsWith('tmp_'))) return;   // 自分の書き込み中は待つ
+    if (pendingDel.size || S.tasks.some((t) => String(t.id).startsWith('tmp_'))) return;   // 自分の書き込み中は待つ
     try {
       const r = await Api.call('poll');
       if (r.version !== S.version) { pollStep = 0; await refresh(false); if (!S.offline) toast('相手の変更を反映しました', 'soft'); }
@@ -714,6 +837,9 @@
   const submitTask = async (form) => {
     const fd = new FormData(form); const id = form.dataset.id;
     const task = { id: id || undefined, title: String(fd.get('title') || '').trim(), note: String(fd.get('note') || '').trim(), due: String(fd.get('due') || ''), eventId: String(fd.get('eventId') || ''), assignee: String(fd.get('assignee') || 'both') };
+    const rawCost = String(fd.get('cost') || '').normalize('NFKC').replace(/[\s,¥￥円]/g, '');
+    if (rawCost && !/^\d{1,8}$/.test(rawCost)) return setErr(form, '費用は数字だけで入力してください（上限 99,999,999円）');
+    task.cost = rawCost === '' ? null : Number(rawCost); task.paid = rawCost === '' ? false : fd.get('paid') === 'on';
     if (!task.title) return setErr(form, 'タスク名を入力してください');
     setErr(form, ''); busy(form, true);
     try { const r = await Api.call('saveTask', { task }); mergeById(S.tasks, r.task); afterWrite(r); closeSheet(); render(); toast(id ? '保存しました' : 'タスクを追加しました'); }
@@ -786,8 +912,8 @@
       case 'delete-event': {
         const ev = evById(id); if (!ev) break;
         const n = S.tasks.filter((t) => t.eventId === id).length;
-        if (!await confirmDialog({ title: `「${ev.title}」を削除しますか？`, body: n ? `紐づくタスク${n}件もいっしょに消えます。` : 'この操作は取り消せません。', ok: '削除する', danger: true })) break;
-        try { const r = await Api.call('deleteEvent', { id }); S.events = S.events.filter((x) => x.id !== id); S.tasks = S.tasks.filter((t) => t.eventId !== id); afterWrite(r); closeSheet(); render(); toast('削除しました'); } catch (er) { toastErr(er); handleAuth(er); }
+        if (!await confirmDialog({ title: `「${ev.title}」を削除しますか？`, body: n ? `紐づくタスク${n}件もいっしょに消えます。（削除後5秒間は元に戻せます）` : '削除後5秒間は元に戻せます。', ok: '削除する', danger: true })) break;
+        closeSheet(); removeEvent(id);
         break;
       }
       case 'add-template': {
@@ -803,14 +929,11 @@
       }
       case 'toggle-task': e.stopPropagation(); toggleTask(id); break;
       case 'edit-task': { const t = S.tasks.find((x) => x.id === id); if (t && !String(id).startsWith('tmp_')) taskForm(t); break; }
-      case 'delete-task': {
-        const t = S.tasks.find((x) => x.id === id); if (!t) break;
-        if (!await confirmDialog({ title: 'このタスクを削除しますか？', body: `「${t.title}」`, ok: '削除する', danger: true })) break;
-        try { const r = await Api.call('deleteTask', { id }); S.tasks = S.tasks.filter((x) => x.id !== id); afterWrite(r); closeSheet(); render(); toast('削除しました'); } catch (er) { toastErr(er); handleAuth(er); }
-        break;
-      }
-      case 'scope': S.scope = el.dataset.scope; render(); break;
-      case 'ev-filter': S.evFilter = id || ''; render(); break;
+      case 'delete-task': { closeSheet(); removeTask(id); break; }
+      case 'toggle-group': { const k = el.dataset.key; if (S.collapsed.has(k)) S.collapsed.delete(k); else S.collapsed.add(k); lsSet('fd.col', JSON.stringify([...S.collapsed])); render(); break; }
+      case 'toggle-paid': e.stopPropagation(); togglePaid(id); break;
+      case 'scope': S.scope = el.dataset.scope; lsSet('fd.scope', S.scope); render(); break;
+      case 'ev-filter': S.evFilter = id || ''; lsSet('fd.evf', S.evFilter); render(); break;
       case 'toggle-done': S.showDone = !S.showDone; render(); break;
       case 'refresh': refresh(true); break;
       case 'close-sheet': closeSheet(); break;
@@ -875,6 +998,35 @@
   }, true);
 
 
+  /* ---- タスクのスワイプ: 右=完了/未完了、左=削除（元に戻せる） ---- */
+  let swipe = null; let swipeUntil = 0;
+  document.addEventListener('click', (e) => { if (Date.now() < swipeUntil) { e.stopPropagation(); e.preventDefault(); } }, true);
+  document.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse') return;
+    const task = e.target.closest && e.target.closest('.task'); if (!task || e.target.closest('.check') || String(task.dataset.id).startsWith('tmp_')) return;
+    swipe = { task, tw: task.parentElement, id: task.dataset.id, x0: e.clientX, y0: e.clientY, dx: 0, lock: null, pid: e.pointerId };
+  });
+  document.addEventListener('pointermove', (e) => {
+    if (!swipe || e.pointerId !== swipe.pid) return;
+    const dx = e.clientX - swipe.x0; const dy = e.clientY - swipe.y0;
+    if (!swipe.lock) {
+      if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) { swipe = null; return; }
+      if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.3) { swipe.lock = 'x'; swipe.task.classList.add('swiping'); try { swipe.task.setPointerCapture(e.pointerId); } catch (er) { /* noop */ } } else return;
+    }
+    const v = Math.max(-150, Math.min(150, dx)); swipe.dx = v;
+    swipe.task.style.transform = `translateX(${v}px)`;
+    swipe.tw.dataset.dir = v > 0 ? 'r' : 'l'; swipe.tw.classList.toggle('armed', Math.abs(v) >= 90);
+  });
+  const endSwipe = (e, cancel) => {
+    if (!swipe || e.pointerId !== swipe.pid) return;
+    const s = swipe; swipe = null; if (s.lock !== 'x') return;
+    swipeUntil = Date.now() + 350;
+    s.task.classList.remove('swiping'); s.task.style.transform = ''; s.tw.classList.remove('armed'); delete s.tw.dataset.dir;
+    if (!cancel && Math.abs(s.dx) >= 90) { haptic(14); if (s.dx > 0) toggleTask(s.id); else removeTask(s.id); }
+  };
+  document.addEventListener('pointerup', (e) => endSwipe(e, false));
+  document.addEventListener('pointercancel', (e) => endSwipe(e, true));
+
   /* ---- 引っ張って更新 ---- */
   (() => {
     const el = document.createElement('div');
@@ -914,7 +1066,9 @@
   window.addEventListener('popstate', () => { if (sheetOpen) closeSheet(true); });
   window.addEventListener('online', () => { S.offline = false; if (S.status === 'app') { refresh(false); } });
   window.addEventListener('offline', () => { S.offline = true; if (S.status === 'app') render(); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+  const leave = () => { flushPending(); lsSet('fd.seen', String(Date.now())); };
+  document.addEventListener('visibilitychange', () => { if (document.hidden) leave(); else wake(); });
+  window.addEventListener('pagehide', leave);
   window.addEventListener('focus', () => wake());
   ['pointerdown', 'keydown', 'touchstart'].forEach((ev) => window.addEventListener(ev, () => { lastAct = Date.now(); }, { passive: true }));
   if (window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
@@ -927,6 +1081,10 @@
     });
     const past = S.events.filter((e) => daysFrom(e.date) < 0).sort((a, b) => b.date.localeCompare(a.date))[0];
     if (past) { const el = -daysFrom(past.date); if (FD.MILESTONES.includes(el) && !lsGet(`fd.ms.${past.id}.${el}`)) { lsSet(`fd.ms.${past.id}.${el}`, '1'); fired = true; setTimeout(() => toast(`✨ ${past.title}から${el}日！`), 900); } }
+    S.events.forEach((ev) => {
+      const d = daysFrom(ev.date);
+      if (MS_DAYS.includes(d) && !lsGet(`fd.cd.${ev.id}.${d}`)) { lsSet(`fd.cd.${ev.id}.${d}`, '1'); fired = true; setTimeout(() => toast(`🎯 「${clipTxt(ev.title)}」まで、あと${d}日！`), 1100); }
+    });
     if (fired) setTimeout(() => burst({ n: 140, power: 11 }), 500);
   };
 

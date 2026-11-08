@@ -28,7 +28,7 @@ var SHEETS = { events: 'events', tasks: 'tasks', members: 'members', sessions: '
 
 var SCHEMA = {
   events:   ['id', 'title', 'emoji', 'kind', 'date', 'time', 'place', 'color', 'note', 'createdBy', 'createdAt', 'updatedAt', 'deleted'],
-  tasks:    ['id', 'eventId', 'title', 'note', 'due', 'assignee', 'done', 'doneBy', 'doneAt', 'createdBy', 'createdAt', 'updatedAt', 'deleted'],
+  tasks:    ['id', 'eventId', 'title', 'note', 'due', 'assignee', 'done', 'doneBy', 'doneAt', 'createdBy', 'createdAt', 'updatedAt', 'deleted', 'cost', 'paid'],
   members:  ['uid', 'name', 'emoji', 'color', 'profileSet', 'updatedAt'],
   sessions: ['hash', 'uid', 'pf', 'exp', 'createdAt'],
   audit:    ['ts', 'uid', 'action', 'target', 'result']
@@ -102,6 +102,7 @@ function route_(req) {
     case 'deleteEvent': return ok_(locked_(function () { return deleteEvent_(user, p); }));
     case 'saveTask':   return ok_(locked_(function () { return saveTask_(user, p); }));
     case 'toggleTask': return ok_(locked_(function () { return toggleTask_(user, p); }));
+    case 'togglePaid': return ok_(locked_(function () { return togglePaid_(user, p); }));
     case 'deleteTask': return ok_(locked_(function () { return deleteTask_(user, p); }));
     case 'logout':     return ok_(logout_(user, req.s, false));
     case 'logoutAll':  return ok_(logout_(user, req.s, true));
@@ -322,7 +323,8 @@ function pubEvent_(r) {
 function pubTask_(r) {
   return { id: r.id, eventId: r.eventId, title: r.title, note: r.note, due: r.due, assignee: r.assignee,
            done: r.done === '1', doneBy: r.doneBy, doneAt: r.doneAt, createdBy: r.createdBy,
-           createdAt: r.createdAt, updatedAt: r.updatedAt };
+           createdAt: r.createdAt, updatedAt: r.updatedAt,
+           cost: (r.cost === '' || r.cost == null) ? null : Number(r.cost), paid: r.paid === '1' };
 }
 
 /* ================================== 入力検証 ================================== */
@@ -489,7 +491,8 @@ function newTask_(user, f, now) {
   return {
     id: Utilities.getUuid().slice(0, 13), eventId: f.eventId || '', title: f.title, note: f.note || '',
     due: f.due || '', assignee: f.assignee || 'both', done: '0', doneBy: '', doneAt: '',
-    createdBy: user.uid, createdAt: now, updatedAt: now, deleted: '0'
+    createdBy: user.uid, createdAt: now, updatedAt: now, deleted: '0',
+    cost: f.cost == null ? '' : String(f.cost), paid: f.paid ? '1' : '0'
   };
 }
 
@@ -519,18 +522,43 @@ function saveTask_(user, p) {
     due: vDate_(src.due, false, '期限'),
     assignee: vAssignee_(src.assignee)
   };
+  var hasCost = Object.prototype.hasOwnProperty.call(src, 'cost');
+  var hasPaid = Object.prototype.hasOwnProperty.call(src, 'paid');
+  if (hasCost) fields.cost = vCost_(src.cost);
+  if (hasPaid) fields.paid = src.paid === true;
 
   var rec;
   if (existing) {
     rec = existing;
     rec.eventId = fields.eventId; rec.title = fields.title; rec.note = fields.note;
     rec.due = fields.due; rec.assignee = fields.assignee; rec.updatedAt = now;
+    if (hasCost) rec.cost = fields.cost === null ? '' : String(fields.cost);
+    if (hasPaid) rec.paid = fields.paid ? '1' : '0';
     updateRow_('tasks', rec);
   } else {
     rec = newTask_(user, fields, now);
     appendRow_('tasks', rec);
   }
   audit_(user.uid, existing ? 'updateTask' : 'createTask', rec.id, 'ok');
+  return { task: pubTask_(rec), version: bump_() };
+}
+
+/** 費用: 空なら未設定(null)、あれば 0〜99,999,999 の整数（円） */
+function vCost_(v) {
+  if (v === null || v === undefined || v === '') return null;
+  var n = Number(v);
+  if (!isFinite(n) || Math.floor(n) !== n || n < 0 || n > 99999999) throw new AppError('INVALID', '費用は 0〜99,999,999 の整数（円）で入力してください');
+  return n;
+}
+
+function togglePaid_(user, p) {
+  var id = clip_(p.id, 40);
+  var rec = readAll_('tasks').filter(function (r) { return r.id === id && notDeleted_(r); })[0];
+  if (!rec) throw new AppError('NOT_FOUND', 'タスクが見つかりません');
+  rec.paid = p.paid === true ? '1' : '0';
+  rec.updatedAt = new Date().toISOString();
+  updateRow_('tasks', rec);
+  audit_(user.uid, p.paid === true ? 'paid' : 'unpaid', id, 'ok');
   return { task: pubTask_(rec), version: bump_() };
 }
 
@@ -580,11 +608,28 @@ function ss_() {
   return ss;
 }
 
+/** 既存のシートに、後から増えた列（見出し）を足す。プロパティで済みを記録し、通常は読み込みなし */
+function ensureColumns_(key, sh) {
+  var props = PropertiesService.getScriptProperties();
+  var cols = SCHEMA[key]; var tag = 'SV_' + key;
+  if (props.getProperty(tag) === String(cols.length)) return;
+  if (sh.getMaxColumns && cols.length > sh.getMaxColumns()) sh.insertColumnsAfter(sh.getMaxColumns(), cols.length - sh.getMaxColumns());
+  var head = sh.getRange(1, 1, 1, cols.length).getValues()[0];
+  for (var i = 0; i < cols.length; i++) {
+    if (head[i] === '' || head[i] == null) {
+      sh.getRange(1, i + 1, 1, 1).setValues([[cols[i]]]).setFontWeight('bold');
+      sh.getRange(1, i + 1, sh.getMaxRows(), 1).setNumberFormat('@');
+    }
+  }
+  props.setProperty(tag, String(cols.length));
+}
+
 function sheet_(key) {
   if (memo_.sheets[key]) return memo_.sheets[key];
   var ss = ss_();
   var cols = SCHEMA[key];
   var sh = ss.getSheetByName(SHEETS[key]);
+  if (sh) ensureColumns_(key, sh);
   if (!sh) {
     sh = ss.insertSheet(SHEETS[key]);
     sh.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
@@ -592,6 +637,7 @@ function sheet_(key) {
     // 全セルをテキスト形式に固定 → 入力値が数式として解釈されない
     sh.getRange(1, 1, sh.getMaxRows(), cols.length).setNumberFormat('@');
     if (key === 'sessions' || key === 'audit') sh.hideSheet();
+    PropertiesService.getScriptProperties().setProperty('SV_' + key, String(cols.length));
   }
   memo_.sheets[key] = sh;
   return sh;
