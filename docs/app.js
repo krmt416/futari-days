@@ -243,7 +243,7 @@
       <i class="orb o1"></i><i class="orb o2"></i><i class="orb o3"></i>
       <div class="hero-top"><span class="hero-kind"><span class="hero-emoji">${esc(ev.emoji)}</span>${esc(kindOf(ev).label)}</span>${ringSvg(pct, label)}</div>
       <div class="hero-main">
-        ${days === 0 ? '<div class="hero-today">TODAY</div><div class="hero-num today" data-count="0">🎉</div>' : `<span class="hero-pre">あと</span><span class="hero-num" data-count="${days}" data-id="${esc(ev.id)}">${days}</span><span class="hero-unit">日</span>`}
+        ${days === 0 ? '<div class="hero-today">TODAY</div><div class="hero-num today" data-count="0">🎉</div>' : `<span class="hero-pre">あと</span><span class="hero-num d${Math.min(String(days).length, 4)}" data-count="${days}" data-id="${esc(ev.id)}">${days}</span><span class="hero-unit">日</span>`}
       </div>
       <h2 class="hero-title">${esc(ev.title)}</h2>
       <p class="hero-date">${fmtDate(ev.date)}${ev.time ? `　${esc(ev.time)}〜` : ''}</p>
@@ -290,7 +290,10 @@
     return `
       <header class="topbar">
         <div><p class="hello">${greeting()}、${esc(m.name || 'あなた')}さん</p><h1 class="big">${d.getMonth() + 1}月${d.getDate()}日<small>（${WD[d.getDay()]}）</small></h1></div>
-        <button class="pair" data-action="open-profile" aria-label="プロフィールを編集">${av(m)}${p ? av(p) : ''}</button>
+        <div class="tb-right">
+          <button class="iconbtn ${S.syncing ? 'spin' : ''}" data-action="refresh" aria-label="最新の状態に更新">${ICON.refresh}</button>
+          <button class="pair" data-action="open-profile" aria-label="プロフィールを編集">${av(m)}${p ? av(p) : ''}</button>
+        </div>
       </header>
       ${up.length ? `
         <section class="heroes ${up.length > 1 ? 'multi' : ''}" id="heroes" aria-label="これからの予定">${up.map(heroHtml).join('')}</section>
@@ -650,7 +653,12 @@
 
   const pollTick = async () => {
     if (document.hidden || S.status !== 'app' || S.syncing) return;
-    try { const r = await Api.call('poll'); if (r.version !== S.version) await refresh(false); } catch (e) { handleAuth(e); }
+    if (S.tasks.some((t) => String(t.id).startsWith('tmp_'))) return;   // 自分の書き込み中は待つ
+    try {
+      const r = await Api.call('poll');
+      if (r.version !== S.version) { await refresh(false); if (!S.offline) toast('相手の変更を反映しました', 'soft'); }
+      else S.offline = false;
+    } catch (e) { handleAuth(e); }
   };
 
   const handleAuth = (e) => {
@@ -848,10 +856,48 @@
     if (idx !== S.heroIdx) { S.heroIdx = idx; $$('.dots i').forEach((d, i) => d.classList.toggle('on', i === idx)); haptic(5); }
   }, true);
 
+
+  /* ---- 引っ張って更新 ---- */
+  (() => {
+    const el = document.createElement('div');
+    el.className = 'ptr'; el.setAttribute('aria-hidden', 'true'); el.innerHTML = ICON.refresh;
+    document.body.appendChild(el);
+    let y0 = null; let x0 = 0; let pull = 0; let active = false; let busyPtr = false;
+    const LIMIT = 70;
+    const show = (v, spin) => {
+      el.style.transform = `translate(-50%, ${v - 54}px) rotate(${Math.min(1, v / LIMIT) * 300}deg)`;
+      el.style.opacity = String(Math.min(1, v / 40)); el.classList.toggle('ready', v >= LIMIT); el.classList.toggle('spin', !!spin);
+    };
+    document.addEventListener('touchstart', (e) => {
+      if (S.status !== 'app' || sheetOpen || busyPtr || window.scrollY > 0 || e.touches.length !== 1) { y0 = null; return; }
+      if (e.target.closest && e.target.closest('input, textarea, select, .fchips')) { y0 = null; return; }
+      y0 = e.touches[0].clientY; x0 = e.touches[0].clientX; pull = 0; active = false; el.style.transition = 'none';
+    }, { passive: true });
+    document.addEventListener('touchmove', (e) => {
+      if (y0 == null) return;
+      const dy = e.touches[0].clientY - y0; const dx = e.touches[0].clientX - x0;
+      if (!active) { if (dy > 10 && dy > Math.abs(dx) * 1.5 && window.scrollY <= 0) active = true; else if (Math.abs(dx) > 14 || dy < -6) { y0 = null; return; } else return; }
+      pull = Math.min(LIMIT + 26, dy * 0.5); show(pull, false);
+    }, { passive: true });
+    const end = async () => {
+      if (y0 == null) return; const was = active; y0 = null; active = false; el.style.transition = '';
+      if (!was) return;
+      if (pull >= LIMIT) {
+        busyPtr = true; haptic(14); show(LIMIT - 8, true);
+        await refresh(true);
+        busyPtr = false;
+      }
+      show(0, false);
+    };
+    document.addEventListener('touchend', end, { passive: true });
+    document.addEventListener('touchcancel', end, { passive: true });
+  })();
+
   window.addEventListener('popstate', () => { if (sheetOpen) closeSheet(true); });
   window.addEventListener('online', () => { S.offline = false; if (S.status === 'app') { refresh(false); } });
   window.addEventListener('offline', () => { S.offline = true; if (S.status === 'app') render(); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) pollTick(); });
+  window.addEventListener('focus', () => pollTick());
   if (window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 
   /* ============================== 起動 ============================== */
@@ -887,8 +933,8 @@
       else if (S.status === 'app') { S.offline = true; render(); toastErr(e); }
       else { S.status = 'login'; S.loginError = e.message; render(); }
     }
-    setInterval(pollTick, 25000);
   };
 
+  setInterval(pollTick, 12000);   // ログイン直後でも動くよう、起動処理とは独立して開始
   boot();
 })();

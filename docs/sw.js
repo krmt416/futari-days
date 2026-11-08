@@ -1,5 +1,5 @@
 /* アプリ本体(同一オリジンの静的ファイル)だけをキャッシュする。API通信・Google関連は一切触らない。 */
-const CACHE = 'futari-days-1.0.0';
+const CACHE = 'futari-days-1.1.1';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'api.js', 'templates.js', 'config.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {

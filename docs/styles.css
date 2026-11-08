@@ -324,3 +324,26 @@ input[type="date"], input[type="time"] { min-height: 49px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; scroll-behavior: auto !important; }
 }
+
+/* 引っ張って更新 / 右上ボタン群 */
+.tb-right { display: flex; align-items: center; gap: 10px; }
+.ptr { position: fixed; z-index: 60; left: 50%; top: calc(env(safe-area-inset-top) + 10px); width: 42px; height: 42px; border-radius: 50%; display: grid; place-items: center; background: var(--surface); color: var(--muted);
+  box-shadow: 0 10px 24px -8px rgba(120, 40, 70, .45); opacity: 0; transform: translate(-50%, -54px); transition: transform .3s cubic-bezier(.22, 1, .36, 1), opacity .25s; pointer-events: none; }
+.ptr.ready { color: var(--brand); } .ptr.spin .ic { animation: spin .8s linear infinite; }
+.toast.soft { background: color-mix(in srgb, var(--brand) 88%, #000); }
+
+/* ヒーローの数字: カード幅と桁数に合わせて縮める（はみ出し・折り返し防止） */
+.hero { container-type: inline-size; }
+.hero-main { flex-wrap: nowrap; gap: 4px; min-width: 0; }
+.hero-pre, .hero-unit { flex: none; white-space: nowrap; word-break: keep-all; }
+.hero-pre { font-size: 20px; } .hero-unit { font-size: 26px; }
+.hero-num { flex: 0 1 auto; white-space: nowrap; font-size: clamp(76px, 25vw, 124px); }
+.hero-num.d3 { font-size: clamp(64px, 21vw, 104px); }
+.hero-num.d4 { font-size: clamp(50px, 16vw, 80px); }
+@supports (width: 1cqw) {
+  .hero-pre { font-size: clamp(16px, 7.2cqw, 24px); } .hero-unit { font-size: clamp(20px, 9cqw, 30px); }
+  .hero-num, .hero-num.d1, .hero-num.d2 { font-size: 40cqw; }
+  .hero-num.d3 { font-size: 31cqw; }
+  .hero-num.d4 { font-size: 23cqw; }
+}
+.hero-num.today { font-size: 92px; }
