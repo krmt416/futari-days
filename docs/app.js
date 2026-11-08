@@ -651,13 +651,31 @@
     finally { S.syncing = false; if (S.status === 'app') render(); }
   };
 
+  /* GAS無料枠の節約: 画面が見えている間だけ、変化がなければ間隔を 30秒→60秒→120秒 と延ばし、5分操作がなければ停止（操作・復帰で再開） */
+  const POLL_STEPS = [30000, 60000, 120000];
+  let pollStep = 0, pollTimer = 0, lastAct = Date.now(), pollPaused = false;
+  const schedule = () => {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(async () => {
+      if (Date.now() - lastAct > 300000) { pollPaused = true; return; }   // 放置中は止める
+      await pollTick();
+      schedule();
+    }, POLL_STEPS[Math.min(pollStep, POLL_STEPS.length - 1)]);
+  };
+  const wake = () => {
+    lastAct = Date.now(); pollStep = 0;
+    pollTick();
+    if (pollPaused) pollPaused = false;
+    schedule();
+  };
+
   const pollTick = async () => {
     if (document.hidden || S.status !== 'app' || S.syncing) return;
     if (S.tasks.some((t) => String(t.id).startsWith('tmp_'))) return;   // 自分の書き込み中は待つ
     try {
       const r = await Api.call('poll');
-      if (r.version !== S.version) { await refresh(false); if (!S.offline) toast('相手の変更を反映しました', 'soft'); }
-      else S.offline = false;
+      if (r.version !== S.version) { pollStep = 0; await refresh(false); if (!S.offline) toast('相手の変更を反映しました', 'soft'); }
+      else { S.offline = false; pollStep = Math.min(pollStep + 1, POLL_STEPS.length - 1); }
     } catch (e) { handleAuth(e); }
   };
 
@@ -896,8 +914,9 @@
   window.addEventListener('popstate', () => { if (sheetOpen) closeSheet(true); });
   window.addEventListener('online', () => { S.offline = false; if (S.status === 'app') { refresh(false); } });
   window.addEventListener('offline', () => { S.offline = true; if (S.status === 'app') render(); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) pollTick(); });
-  window.addEventListener('focus', () => pollTick());
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+  window.addEventListener('focus', () => wake());
+  ['pointerdown', 'keydown', 'touchstart'].forEach((ev) => window.addEventListener(ev, () => { lastAct = Date.now(); }, { passive: true }));
   if (window.matchMedia) window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
 
   /* ============================== 起動 ============================== */
@@ -935,6 +954,6 @@
     }
   };
 
-  setInterval(pollTick, 12000);   // ログイン直後でも動くよう、起動処理とは独立して開始
+  schedule();   // ログイン直後でも動くよう、起動処理とは独立して開始
   boot();
 })();

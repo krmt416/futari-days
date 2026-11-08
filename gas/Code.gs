@@ -236,7 +236,7 @@ function authSession_(token) {
         if (fresh) { fresh.exp = String(now + APP.SESSION_DAYS * 86400000); updateRow_('sessions', fresh); }
       });
     }
-    cache.put('ss_' + hash, uid + '|' + cfg.fp, 600);
+    cache.put('ss_' + hash, uid + '|' + cfg.fp, 21600);
   }
   if (SLOTS.map(uidOfSlot_).indexOf(uid) < 0) throw new AppError('AUTH', 'ログインが必要です');
   return { uid: uid, hash: hash };
@@ -259,13 +259,22 @@ function logout_(user, token, all) {
 
 /* ================================== スナップショット ================================== */
 
+/* 無料枠の節約: poll / bootstrap は可能な限りキャッシュだけで返し、スプレッドシートを読まない */
 function version_() {
-  return PropertiesService.getScriptProperties().getProperty('DV') || '0';
+  var cache = CacheService.getScriptCache();
+  var v = cache.get('DV');
+  if (v) return v;
+  v = PropertiesService.getScriptProperties().getProperty('DV') || '0';
+  cache.put('DV', v, 21600);
+  return v;
 }
 
 function bump_() {
   var v = String(Date.now());
   PropertiesService.getScriptProperties().setProperty('DV', v);
+  var cache = CacheService.getScriptCache();
+  cache.put('DV', v, 21600);
+  cache.remove('snap');   // データが変わったのでスナップショットのキャッシュを捨てる
   return v;
 }
 
@@ -276,18 +285,31 @@ function ensureMember_(slot) {
     uid: uid, name: slot === 'a' ? 'わたし' : 'パートナー', emoji: slot === 'a' ? '🌸' : '🌿', color: slot === 'a' ? 'rose' : 'sage',
     profileSet: '0', updatedAt: new Date().toISOString()
   });
+  CacheService.getScriptCache().remove('snap');   // メンバーが増えたのでスナップショットを作り直す
 }
 
 function snapshot_(user) {
   config_();
-  return {
-    me: user.uid,
-    members: membersPublic_(),
-    events: readAll_('events').filter(notDeleted_).map(pubEvent_),
-    tasks: readAll_('tasks').filter(notDeleted_).map(pubTask_),
-    version: version_(),
-    serverTime: new Date().toISOString()
-  };
+  var cache = CacheService.getScriptCache();
+  var ver = version_();
+  var body = null;
+  var hit = cache.get('snap');
+  if (hit) {
+    try { var c = JSON.parse(hit); if (c.version === ver) body = c; } catch (e) { body = null; }
+  }
+  if (!body) {
+    body = {
+      members: membersPublic_(),
+      events: readAll_('events').filter(notDeleted_).map(pubEvent_),
+      tasks: readAll_('tasks').filter(notDeleted_).map(pubTask_),
+      version: ver
+    };
+    try {
+      var j = JSON.stringify(body);
+      if (j.length < 90000) cache.put('snap', j, 21600);   // 1キーの上限は100KB
+    } catch (e) { /* キャッシュできなくても動作に影響なし */ }
+  }
+  return { me: user.uid, members: body.members, events: body.events, tasks: body.tasks, version: body.version, serverTime: new Date().toISOString() };
 }
 
 function notDeleted_(r) { return r.deleted !== '1'; }
